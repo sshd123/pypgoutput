@@ -8,3 +8,4 @@ src/pypgoutput.egg-info
 test/output.txt
 .coverage
 dist/
+.idea

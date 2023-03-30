@@ -19,6 +19,10 @@ from pypgoutput.utils import SourceDBHandler
 logger = logging.getLogger(__name__)
 
 
+class PgoutputError(Exception):
+    pass
+
+
 class ReplicationMessage(pydantic.BaseModel):
     message_id: pydantic.UUID4
     data_start: int
@@ -130,6 +134,7 @@ class LogicalReplicationReader:
 
         # save map of type oid to readable name
         self.pg_types: typing.Dict[int, str] = dict()
+
         self.setup()
 
     def setup(self) -> None:
@@ -152,7 +157,6 @@ class LogicalReplicationReader:
         self.extractor.close()
         self.pipe_out_conn.close()
         self.pipe_in_conn.close()
-        self.extractor.close()
 
     def read_raw_extracted(self) -> typing.Generator[ReplicationMessage, None, None]:
         """yields ReplicationMessages from the pipe as written by extractor process"""
@@ -168,7 +172,7 @@ class LogicalReplicationReader:
                 yield item
                 self.pipe_out_conn.send({"id": item.message_id})
             if iter_count % 50 == 0:
-                logger.debug(f"pipe poll count: {iter_count}, messages processed: {msg_count}")
+                logger.info(f"pipe poll count: {iter_count}, messages processed: {msg_count}")
             iter_count += 1
 
     def transform_raw(
@@ -190,7 +194,8 @@ class LogicalReplicationReader:
             elif message_type == "T":
                 yield from self.process_truncate(message=msg, transaction=transaction_metadata)
             elif message_type == "C":
-                del transaction_metadata  # null out this value after commit
+                # del transaction_metadata  # null out this value after commit
+                yield self.process_txn_commit(message=msg, transaction=transaction_metadata)
 
     def process_relation(self, message: ReplicationMessage) -> None:
         relation_msg: decoders.Relation = decoders.Relation(message.payload)
@@ -231,6 +236,7 @@ class LogicalReplicationReader:
             for c in column_definitions
             if c.part_of_pkey is True
         }
+        print(key_only_schema_mapping_args)
         self.key_only_table_models[relation_id] = pydantic.create_model(
             f"KeyDynamicSchemaModel_{relation_id}", **key_only_schema_mapping_args
         )
@@ -250,15 +256,18 @@ class LogicalReplicationReader:
         decoded_msg: decoders.Insert = decoders.Insert(message.payload)
         relation_id: int = decoded_msg.relation_id
         after = map_tuple_to_dict(tuple_data=decoded_msg.new_tuple, relation=self.table_schemas[relation_id])
-        return ChangeEvent(
-            op=decoded_msg.byte1,
-            message_id=message.message_id,
-            lsn=message.data_start,
-            transaction=transaction,
-            table_schema=self.table_schemas[relation_id],
-            before=None,
-            after=self.table_models[relation_id](**after),
-        )
+        try:
+            return ChangeEvent(
+                op=decoded_msg.byte1,
+                message_id=message.message_id,
+                lsn=message.data_start,
+                transaction=transaction,
+                table_schema=self.table_schemas[relation_id],
+                before=None,
+                after=self.table_models[relation_id](**after),
+            )
+        except Exception as exc:
+            raise PgoutputError(f"Error creating ChangeEvent: {exc}")
 
     def process_update(self, message: ReplicationMessage, transaction: Transaction) -> ChangeEvent:
         decoded_msg: decoders.Update = decoders.Update(message.payload)
@@ -273,15 +282,33 @@ class LogicalReplicationReader:
         else:
             before_typed = None
         after = map_tuple_to_dict(tuple_data=decoded_msg.new_tuple, relation=self.table_schemas[relation_id])
-        return ChangeEvent(
-            op=decoded_msg.byte1,
-            message_id=message.message_id,
-            lsn=message.data_start,
-            transaction=transaction,
-            table_schema=self.table_schemas[relation_id],
-            before=before_typed,
-            after=self.table_models[relation_id](**after),
-        )
+        try:
+            return ChangeEvent(
+                op=decoded_msg.byte1,
+                message_id=message.message_id,
+                lsn=message.data_start,
+                transaction=transaction,
+                table_schema=self.table_schemas[relation_id],
+                before=before_typed,
+                after=self.table_models[relation_id](**after),
+            )
+        except Exception as exc:
+            raise PgoutputError(f"Error creating ChangeEvent: {exc}")
+
+    def process_txn_commit(self, message: ReplicationMessage, transaction: Transaction) -> ChangeEvent:
+        decoded_msg: decoders.Commit = decoders.Commit(message.payload)
+        try:
+            return ChangeEvent(
+                op=decoded_msg.byte1,
+                message_id=message.message_id,
+                lsn=message.data_start,
+                transaction=transaction,
+                table_schema=list(self.table_schemas.values())[0],
+                before=None,
+                after=None,
+            )
+        except Exception as exc:
+            raise PgoutputError(f"Error commit ChangeEvent: {exc}")
 
     def process_delete(self, message: ReplicationMessage, transaction: Transaction) -> ChangeEvent:
         decoded_msg: decoders.Delete = decoders.Delete(message.payload)
@@ -294,30 +321,36 @@ class LogicalReplicationReader:
             # message type is K and means only replica identity index is present in before tuple
             # only DEFAULT is implemented so the index can only be the primary key
             before_typed = self.key_only_table_models[relation_id](**before_raw)
-        return ChangeEvent(
-            op=decoded_msg.byte1,
-            message_id=message.message_id,
-            lsn=message.data_start,
-            transaction=transaction,
-            table_schema=self.table_schemas[relation_id],
-            before=before_typed,
-            after=None,
-        )
+        try:
+            return ChangeEvent(
+                op=decoded_msg.byte1,
+                message_id=message.message_id,
+                lsn=message.data_start,
+                transaction=transaction,
+                table_schema=self.table_schemas[relation_id],
+                before=before_typed,
+                after=None,
+            )
+        except Exception as exc:
+            raise PgoutputError(f"Error creating ChangeEvent: {exc}")
 
     def process_truncate(
         self, message: ReplicationMessage, transaction: Transaction
     ) -> typing.Generator[ChangeEvent, None, None]:
         decoded_msg: decoders.Truncate = decoders.Truncate(message.payload)
         for relation_id in decoded_msg.relation_ids:
-            yield ChangeEvent(
-                op=decoded_msg.byte1,
-                message_id=message.message_id,
-                lsn=message.data_start,
-                transaction=transaction,
-                table_schema=self.table_schemas[relation_id],
-                before=None,
-                after=None,
-            )
+            try:
+                yield ChangeEvent(
+                    op=decoded_msg.byte1,
+                    message_id=message.message_id,
+                    lsn=message.data_start,
+                    transaction=transaction,
+                    table_schema=self.table_schemas[relation_id],
+                    before=None,
+                    after=None,
+                )
+            except Exception as exc:
+                raise PgoutputError(f"Error creating ChangeEvent: {exc}")
 
     # how to put a better type hint?
     def __iter__(self) -> typing.Any:
@@ -327,7 +360,8 @@ class LogicalReplicationReader:
         try:
             return next(self.transformed_msgs)
         except Exception as err:
-            self.stop()
+            self.stop()  # try to close everything
+            logger.error(f"Error extracting LR logs: {err}")
             raise StopIteration from err
 
 
@@ -352,10 +386,6 @@ class ExtractRaw(Process):
         self.conn = psycopg2.extras.LogicalReplicationConnection(self.dsn)
         self.cur = psycopg2.extras.ReplicationCursor(self.conn)
 
-    def close(self) -> None:
-        self.cur.close()
-        self.conn.close()
-
     def run(self) -> None:
         replication_options = {"publication_names": self.publication_name, "proto_version": "1"}
         try:
@@ -364,7 +394,7 @@ class ExtractRaw(Process):
             self.cur.create_replication_slot(self.slot_name, output_plugin="pgoutput")
             self.cur.start_replication(slot_name=self.slot_name, decode=False, options=replication_options)
         try:
-            logger.info(f"Starting replication from slot: '{self.slot_name}'")
+            logger.info(f"Starting replication from slot: {self.slot_name}")
             self.cur.consume_stream(self.msg_consumer)
         except Exception as err:
             logger.error(f"Error consuming stream from slot: '{self.slot_name}'. {err}")
